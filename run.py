@@ -19,8 +19,8 @@ Notes / assumptions:
 - IMU angular velocity (w_RS_S_*) is mapped to state angular velocity
   (Vroll, Vpitch, Vyaw) as a simple axis correspondence (x->roll-rate, etc.).
 - IMU linear acceleration (a_RS_S_*) is mapped to state acceleration (Ax, Ay, Az).
-- absolute_sensor.csv provides absolute position; only the first 4 columns are used:
-    timestamp_ns, x, y, z. All remaining columns are ignored.
+- absolute_sensor.csv provides absolute pose; only the first 8 columns are used:
+    [timestamp_ns, x, y, z, qw, qx, qy, qz]. All remaining columns are ignored.
 - Measurement covariances are derived from noise densities in sensor.yaml using
   sigma_sample = noise_density * sqrt(rate_hz) (i.e., noise_density / sqrt(dt)).
 
@@ -182,25 +182,67 @@ def _load_imu_csv(path: Path) -> Iterable[Tuple[int, float, float, float, float,
 
 
 def _load_absolute_position_csv(path: Path) -> Iterable[Tuple[int, float, float, float]]:
-    """Yield absolute position rows: (timestamp_ns, x, y, z).
+    """Yield absolute pose rows: (timestamp_ns, x, y, z, roll, pitch, yaw).
 
     File is expected to have no header and potentially many columns; only the
-    first 4 are used.
+    first 8 are used: [t, x, y, z, qw, qx, qy, qz].
     """
 
     with path.open("r", newline="", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
         for row in reader:
-            if not row or len(row) < 4:
+            if not row or len(row) < 8:
                 continue
             try:
                 t_ns = _parse_timestamp_ns(row[0])
                 x = float(row[1])
                 y = float(row[2])
                 z = float(row[3])
+                qw = float(row[4])
+                qx = float(row[5])
+                qy = float(row[6])
+                qz = float(row[7])
             except ValueError:
                 continue
-            yield (t_ns, x, y, z)
+
+            roll, pitch, yaw = _quat_to_rpy(qw, qx, qy, qz)
+            yield (t_ns, x, y, z, roll, pitch, yaw)
+
+
+def _quat_to_rpy(qw: float, qx: float, qy: float, qz: float) -> Tuple[float, float, float]:
+    """Convert quaternion (qw,qx,qy,qz) to roll/pitch/yaw (rad).
+
+    Assumes scalar-first quaternion ordering as specified by the user.
+    """
+
+    n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if n <= 0.0 or not math.isfinite(n):
+        return (0.0, 0.0, 0.0)
+    qw /= n
+    qx /= n
+    qy /= n
+    qz /= n
+
+    # roll (x-axis rotation)
+    sinr_cosp = 2.0 * (qw * qx + qy * qz)
+    cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    # pitch (y-axis rotation)
+    sinp = 2.0 * (qw * qy - qz * qx)
+    if sinp >= 1.0:
+        pitch = math.pi / 2.0
+    elif sinp <= -1.0:
+        pitch = -math.pi / 2.0
+    else:
+        pitch = math.asin(sinp)
+
+    # yaw (z-axis rotation)
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return (roll, pitch, yaw)
 
 
 def _make_measurement_covariance(rate_hz: float, gyro_nd: float, accel_nd: float) -> List[List[float]]:
@@ -219,16 +261,28 @@ def _make_measurement_covariance(rate_hz: float, gyro_nd: float, accel_nd: float
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run python_ekf.py on IMU data.csv")
-    parser.add_argument("--data", default="src/data.csv", help="Path to IMU CSV (default: src/data.csv)")
-    parser.add_argument("--sensor", default="sensor.yaml", help="Path to sensor.yaml (default: sensor.yaml)")
+    parser.add_argument("--data", default="./example/data.csv", help="Path to IMU CSV (default: src/data.csv)")
+    parser.add_argument("--sensor", default="./example/data/sensor.yaml", help="Path to sensor.yaml (default: sensor.yaml)")
     parser.add_argument(
         "--absolute",
-        default="src/absolute_sensor.csv",
+        default="./example/data/absolute_sensor.csv",
         help="Path to absolute_sensor.csv (default: src/absolute_sensor.csv)",
     )
-    parser.add_argument("--output_dir", default="src/output", help="Output directory (default: src/output)")
+    parser.add_argument("--output_dir", default="./example/output", help="Output directory (default: src/output)")
     parser.add_argument("--output_name", default="trajectory.csv", help="Output filename (default: trajectory.csv)")
     parser.add_argument("--mahalanobis", type=float, default=float("inf"), help="Mahalanobis gate (sigmas)")
+    parser.add_argument(
+        "--abs_pos_sigma",
+        type=float,
+        default=0.05,
+        help="Absolute pose position measurement standard deviation (meters)",
+    )
+    parser.add_argument(
+        "--abs_ori_sigma",
+        type=float,
+        default=0.1,
+        help="Absolute pose orientation measurement standard deviation (radians)",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -267,10 +321,22 @@ def main() -> int:
     accel_nd = noise["accelerometer_noise_density"]
 
     cov6 = _make_measurement_covariance(rate_hz, gyro_nd, accel_nd)
-    # Absolute position sensor covariance: sigma = 0.05 m
-    pos_sigma = 0.05
+    # Absolute pose sensor covariance: position + orientation
+    pos_sigma = float(args.abs_pos_sigma)
+    ori_sigma = float(args.abs_ori_sigma)
+    if pos_sigma <= 0.0 or ori_sigma <= 0.0:
+        raise ValueError("abs_pos_sigma and abs_ori_sigma must be > 0")
+
     pos_var = pos_sigma * pos_sigma
-    cov3 = [[pos_var, 0.0, 0.0], [0.0, pos_var, 0.0], [0.0, 0.0, pos_var]]
+    ori_var = ori_sigma * ori_sigma
+    cov6_abs = [
+        [pos_var, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, pos_var, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, pos_var, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, ori_var, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, ori_var, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, ori_var],
+    ]
 
     ekf = EKF()
 
@@ -305,7 +371,7 @@ def main() -> int:
         writer = csv.writer(f_out)
         writer.writerow(header)
 
-        # Stream and time-merge IMU + absolute position measurements
+        # Stream and time-merge IMU + absolute pose measurements
         imu_iter = iter(_load_imu_csv(data_path))
         abs_iter = iter(_load_absolute_position_csv(abs_path))
 
@@ -335,14 +401,21 @@ def main() -> int:
 
             # Process all absolute measurements at this timestamp
             while abs_next is not None and abs_next[0] == next_ts:
-                _, x, y, z = abs_next
+                _, x, y, z, roll, pitch, yaw = abs_next
                 abs_next = next(abs_iter, None)
 
                 meas = Measurement.from_subset(
                     time=t_sec,
-                    update_indices=[StateMemberX, StateMemberY, StateMemberZ],
-                    values=[x, y, z],
-                    covariance=cov3,
+                    update_indices=[
+                        StateMemberX,
+                        StateMemberY,
+                        StateMemberZ,
+                        StateMemberRoll,
+                        StateMemberPitch,
+                        StateMemberYaw,
+                    ],
+                    values=[x, y, z, roll, pitch, yaw],
+                    covariance=cov6_abs,
                     mahalanobis_thresh=args.mahalanobis,
                 )
                 ekf.process_measurement(meas)
