@@ -25,6 +25,12 @@ Notes / assumptions:
     using the filter's current roll/pitch estimate.
 - absolute_sensor.csv provides absolute pose; only the first 8 columns are used:
     [timestamp_ns, x, y, z, qw, qx, qy, qz]. All remaining columns are ignored.
+- relative.csv provides *relative* pose increments; expected columns:
+        timestamp_ns, dx, dy, dz, dqw, dqx, dqy, dqz
+    These increments are accumulated into a pose stream and fused like an absolute
+    pose measurement. If both absolute and relative are enabled, the relative pose
+    stream is automatically aligned to the absolute pose (first shared timestamp)
+    and used only at timestamps where an absolute measurement is not present.
 - Measurement covariances are derived from noise densities in sensor.yaml using
   sigma_sample = noise_density * sqrt(rate_hz) (i.e., noise_density / sqrt(dt)).
 
@@ -40,7 +46,7 @@ import math
 import os
 from pathlib import Path
 import re
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 
 # Local, repo-contained EKF implementation
@@ -199,8 +205,8 @@ def _load_imu_csv(path: Path) -> Iterable[Tuple[int, float, float, float, float,
             yield (t_ns, wx, wy, wz, ax, ay, az)
 
 
-def _load_absolute_position_csv(path: Path) -> Iterable[Tuple[int, float, float, float]]:
-    """Yield absolute pose rows: (timestamp_ns, x, y, z, roll, pitch, yaw).
+def _load_absolute_pose_csv(path: Path) -> Iterator[Tuple[int, float, float, float, float, float, float, float]]:
+    """Yield absolute pose rows: (timestamp_ns, x, y, z, qw, qx, qy, qz).
 
     File is expected to have no header and potentially many columns; only the
     first 8 are used: [t, x, y, z, qw, qx, qy, qz].
@@ -223,8 +229,82 @@ def _load_absolute_position_csv(path: Path) -> Iterable[Tuple[int, float, float,
             except ValueError:
                 continue
 
-            roll, pitch, yaw = _quat_to_rpy(qw, qx, qy, qz)
-            yield (t_ns, x, y, z, roll, pitch, yaw)
+            qw, qx, qy, qz = _quat_normalize(qw, qx, qy, qz)
+            yield (t_ns, x, y, z, qw, qx, qy, qz)
+
+
+def _load_relative_pose_csv(path: Path) -> Iterator[Tuple[int, float, float, float, float, float, float, float]]:
+    """Yield relative pose increments: (timestamp_ns, dx, dy, dz, dqw, dqx, dqy, dqz).
+
+    Accepts files with or without a header.
+    """
+
+    with path.open("r", newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or len(row) < 8:
+                continue
+
+            try:
+                t_ns = _parse_timestamp_ns(row[0])
+                dx = float(row[1])
+                dy = float(row[2])
+                dz = float(row[3])
+                dqw = float(row[4])
+                dqx = float(row[5])
+                dqy = float(row[6])
+                dqz = float(row[7])
+            except ValueError:
+                # likely header or malformed row
+                continue
+
+            dqw, dqx, dqy, dqz = _quat_normalize(dqw, dqx, dqy, dqz)
+            yield (t_ns, dx, dy, dz, dqw, dqx, dqy, dqz)
+
+
+def _quat_normalize(qw: float, qx: float, qy: float, qz: float) -> Tuple[float, float, float, float]:
+    n = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    if n <= 0.0 or not math.isfinite(n):
+        return (1.0, 0.0, 0.0, 0.0)
+    inv = 1.0 / n
+    return (qw * inv, qx * inv, qy * inv, qz * inv)
+
+
+def _quat_conj(qw: float, qx: float, qy: float, qz: float) -> Tuple[float, float, float, float]:
+    return (qw, -qx, -qy, -qz)
+
+
+def _quat_mul(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def _quat_rotate_vec(q: Tuple[float, float, float, float], v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    # v' = q ⊗ (0,v) ⊗ q*
+    qw, qx, qy, qz = q
+    vx, vy, vz = v
+    t2 = qw * qx
+    t3 = qw * qy
+    t4 = qw * qz
+    t5 = -qx * qx
+    t6 = qx * qy
+    t7 = qx * qz
+    t8 = -qy * qy
+    t9 = qy * qz
+    t10 = -qz * qz
+    rx = 2.0 * ((t8 + t10) * vx + (t6 - t4) * vy + (t3 + t7) * vz) + vx
+    ry = 2.0 * ((t4 + t6) * vx + (t5 + t10) * vy + (t9 - t2) * vz) + vy
+    rz = 2.0 * ((t7 - t3) * vx + (t2 + t9) * vy + (t5 + t8) * vz) + vz
+    return (rx, ry, rz)
 
 
 def _quat_to_rpy(qw: float, qx: float, qy: float, qz: float) -> Tuple[float, float, float]:
@@ -286,7 +366,36 @@ def main() -> int:
     parser.add_argument(
         "--absolute",
         default="./example/data/absolute_sensor.csv",
-        help="Path to absolute_sensor.csv (default: src/absolute_sensor.csv)",
+        help="Path to absolute_sensor.csv (ignored if --no_absolute)",
+    )
+    parser.add_argument(
+        "--use_absolute",
+        action="store_true",
+        default=False,
+        help="Use absolute pose measurements from absolute_sensor.csv (default: true)",
+    )
+    parser.add_argument(
+        "--no_absolute",
+        action="store_false",
+        dest="use_absolute",
+        help="Disable absolute pose measurements",
+    )
+    parser.add_argument(
+        "--relative",
+        default="./example/data/relative.csv",
+        help="Path to relative.csv (ignored if --no_relative)",
+    )
+    parser.add_argument(
+        "--use_relative",
+        action="store_true",
+        default=True,
+        help="Use relative pose increments from relative.csv (default: false)",
+    )
+    parser.add_argument(
+        "--no_relative",
+        action="store_false",
+        dest="use_relative",
+        help="Disable relative pose increments",
     )
     parser.add_argument("--output_dir", default="./example/output", help="Output directory (default: src/output)")
     parser.add_argument("--output_name", default="trajectory.csv", help="Output filename (default: trajectory.csv)")
@@ -322,6 +431,7 @@ def main() -> int:
     data_path = (repo_root / args.data).resolve() if not os.path.isabs(args.data) else Path(args.data)
     sensor_path = (repo_root / args.sensor).resolve() if not os.path.isabs(args.sensor) else Path(args.sensor)
     abs_path = (repo_root / args.absolute).resolve() if not os.path.isabs(args.absolute) else Path(args.absolute)
+    rel_path = (repo_root / args.relative).resolve() if not os.path.isabs(args.relative) else Path(args.relative)
 
     # Fallback to example paths if defaults weren't found
     if not data_path.exists():
@@ -338,14 +448,25 @@ def main() -> int:
         else:
             raise FileNotFoundError(f"Could not find sensor.yaml at {sensor_path} (and no fallback at {fallback})")
 
-    if not abs_path.exists():
-        fallback = repo_root / "example" / "data" / "absolute_sensor.csv"
-        if fallback.exists():
-            abs_path = fallback
-        else:
-            raise FileNotFoundError(
-                f"Could not find absolute sensor CSV at {abs_path} (and no fallback at {fallback})"
-            )
+    if args.use_absolute:
+        if not abs_path.exists():
+            fallback = repo_root / "example" / "data" / "absolute_sensor.csv"
+            if fallback.exists():
+                abs_path = fallback
+            else:
+                raise FileNotFoundError(
+                    f"Could not find absolute sensor CSV at {abs_path} (and no fallback at {fallback})"
+                )
+
+    if args.use_relative:
+        if not rel_path.exists():
+            fallback = repo_root / "example" / "data" / "relative.csv"
+            if fallback.exists():
+                rel_path = fallback
+            else:
+                raise FileNotFoundError(
+                    f"Could not find relative CSV at {rel_path} (and no fallback at {fallback})"
+                )
 
     noise = _parse_sensor_yaml_for_noise(sensor_path)
     rate_hz = noise["rate_hz"]
@@ -403,38 +524,71 @@ def main() -> int:
         writer = csv.writer(f_out)
         writer.writerow(header)
 
-        # Stream and time-merge IMU + absolute pose measurements
+        # Stream and time-merge IMU + (optional) absolute pose + (optional) relative pose increments
         imu_iter = iter(_load_imu_csv(data_path))
-        abs_iter = iter(_load_absolute_position_csv(abs_path))
+        abs_iter = iter(_load_absolute_pose_csv(abs_path)) if args.use_absolute else iter(())
+        rel_iter = iter(_load_relative_pose_csv(rel_path)) if args.use_relative else iter(())
 
         imu_next = next(imu_iter, None)
         abs_next = next(abs_iter, None)
+        rel_next = next(rel_iter, None)
 
-        if imu_next is None and abs_next is None:
-            raise ValueError("No measurements found in either IMU or absolute sensor inputs")
+        if imu_next is None and abs_next is None and rel_next is None:
+            raise ValueError("No measurements found in enabled inputs")
 
         first_candidates = []
         if imu_next is not None:
             first_candidates.append(imu_next[0])
         if abs_next is not None:
             first_candidates.append(abs_next[0])
+        if rel_next is not None:
+            first_candidates.append(rel_next[0])
         first_t_ns = min(first_candidates)
 
-        while imu_next is not None or abs_next is not None:
+        # Relative pose accumulator (in the relative stream's own frame)
+        rel_p = (0.0, 0.0, 0.0)
+        rel_q = (1.0, 0.0, 0.0, 0.0)
+        rel_seen = False
+        rel_aligned = not args.use_absolute  # if no absolute, treat rel frame as world
+        align_p = (0.0, 0.0, 0.0)
+        align_q = (1.0, 0.0, 0.0, 0.0)
+
+        while imu_next is not None or abs_next is not None or rel_next is not None:
             next_ts: int
-            if imu_next is None:
-                next_ts = abs_next[0]
-            elif abs_next is None:
-                next_ts = imu_next[0]
-            else:
-                next_ts = imu_next[0] if imu_next[0] <= abs_next[0] else abs_next[0]
+            next_ts = min(
+                ts
+                for ts in (
+                    imu_next[0] if imu_next is not None else None,
+                    abs_next[0] if abs_next is not None else None,
+                    rel_next[0] if rel_next is not None else None,
+                )
+                if ts is not None
+            )
 
             t_sec = (next_ts - first_t_ns) * 1e-9
 
+            # Process all relative increments at this timestamp (update accumulator)
+            rel_updated_this_ts = False
+            while rel_next is not None and rel_next[0] == next_ts:
+                _, dx, dy, dz, dqw, dqx, dqy, dqz = rel_next
+                rel_next = next(rel_iter, None)
+                rel_updated_this_ts = True
+                rel_seen = True
+
+                rel_p = (rel_p[0] + dx, rel_p[1] + dy, rel_p[2] + dz)
+                rel_q = _quat_mul(rel_q, (dqw, dqx, dqy, dqz))
+                rel_q = _quat_normalize(*rel_q)
+
             # Process all absolute measurements at this timestamp
+            abs_present_this_ts = False
+            last_abs_pose: Optional[Tuple[float, float, float, float, float, float, float]] = None
             while abs_next is not None and abs_next[0] == next_ts:
-                _, x, y, z, roll, pitch, yaw = abs_next
+                abs_present_this_ts = True
+                _, ax_p, ay_p, az_p, qw, qx, qy, qz = abs_next
                 abs_next = next(abs_iter, None)
+
+                roll, pitch, yaw = _quat_to_rpy(qw, qx, qy, qz)
+                last_abs_pose = (ax_p, ay_p, az_p, qw, qx, qy, qz)
 
                 meas = Measurement.from_subset(
                     time=t_sec,
@@ -446,7 +600,48 @@ def main() -> int:
                         StateMemberPitch,
                         StateMemberYaw,
                     ],
-                    values=[x, y, z, roll, pitch, yaw],
+                    values=[ax_p, ay_p, az_p, roll, pitch, yaw],
+                    covariance=cov6_abs,
+                    mahalanobis_thresh=args.mahalanobis,
+                )
+                ekf.process_measurement(meas)
+
+            # If both streams are enabled, align the relative frame to the absolute pose once.
+            # (Does not require an exact timestamp match; uses the latest accumulated rel pose.)
+            if (not rel_aligned) and rel_seen and (last_abs_pose is not None):
+                ax_p, ay_p, az_p, qw, qx, qy, qz = last_abs_pose
+                q_abs = (qw, qx, qy, qz)
+                q_rel = rel_q
+                align_q = _quat_mul(q_abs, _quat_conj(*q_rel))
+                align_q = _quat_normalize(*align_q)
+
+                rel_p_rot = _quat_rotate_vec(align_q, rel_p)
+                align_p = (ax_p - rel_p_rot[0], ay_p - rel_p_rot[1], az_p - rel_p_rot[2])
+                rel_aligned = True
+
+            # Fuse relative pose as an observation (but avoid double-counting when absolute is present at same timestamp)
+            if args.use_relative and rel_updated_this_ts and rel_aligned and (not abs_present_this_ts):
+                if args.use_absolute:
+                    p_fused = _quat_rotate_vec(align_q, rel_p)
+                    p_fused = (p_fused[0] + align_p[0], p_fused[1] + align_p[1], p_fused[2] + align_p[2])
+                    q_fused = _quat_mul(align_q, rel_q)
+                    q_fused = _quat_normalize(*q_fused)
+                else:
+                    p_fused = rel_p
+                    q_fused = rel_q
+
+                roll, pitch, yaw = _quat_to_rpy(*q_fused)
+                meas = Measurement.from_subset(
+                    time=t_sec,
+                    update_indices=[
+                        StateMemberX,
+                        StateMemberY,
+                        StateMemberZ,
+                        StateMemberRoll,
+                        StateMemberPitch,
+                        StateMemberYaw,
+                    ],
+                    values=[p_fused[0], p_fused[1], p_fused[2], roll, pitch, yaw],
                     covariance=cov6_abs,
                     mahalanobis_thresh=args.mahalanobis,
                 )
