@@ -19,6 +19,10 @@ Notes / assumptions:
 - IMU angular velocity (w_RS_S_*) is mapped to state angular velocity
   (Vroll, Vpitch, Vyaw) as a simple axis correspondence (x->roll-rate, etc.).
 - IMU linear acceleration (a_RS_S_*) is mapped to state acceleration (Ax, Ay, Az).
+- IMPORTANT: Most IMUs report *specific force* (includes gravity). If you feed that
+    directly into the EKF as linear acceleration, you will get unrealistic
+    translations quickly. Use --remove_gravity to subtract gravity in the body frame
+    using the filter's current roll/pitch estimate.
 - absolute_sensor.csv provides absolute pose; only the first 8 columns are used:
     [timestamp_ns, x, y, z, qw, qx, qy, qz]. All remaining columns are ignored.
 - Measurement covariances are derived from noise densities in sensor.yaml using
@@ -59,6 +63,20 @@ from src.python_ekf import (
     StateMemberYaw,
     StateMemberZ,
 )
+
+
+def _gravity_body_from_rp(roll: float, pitch: float, g: float) -> Tuple[float, float, float]:
+    """Gravity vector expressed in the body frame, given roll/pitch.
+
+    Assumes world +Z is up and R = Rz(yaw)*Ry(pitch)*Rx(roll).
+    gravity_body = R^T * [0,0,g] = g * [-sin(p), cos(p)*sin(r), cos(p)*cos(r)]
+    """
+
+    sp = math.sin(pitch)
+    cp = math.cos(pitch)
+    sr = math.sin(roll)
+    cr = math.cos(roll)
+    return (-g * sp, g * cp * sr, g * cp * cr)
 
 
 def _parse_sensor_yaml_for_noise(path: Path) -> Dict[str, float]:
@@ -246,9 +264,11 @@ def _quat_to_rpy(qw: float, qx: float, qy: float, qz: float) -> Tuple[float, flo
 
 
 def _make_measurement_covariance(rate_hz: float, gyro_nd: float, accel_nd: float) -> List[List[float]]:
-    # Discrete-time stddev approximation: sigma = nd * sqrt(rate_hz)
-    gyro_var = (gyro_nd * math.sqrt(rate_hz)) ** 2
-    accel_var = (accel_nd * math.sqrt(rate_hz)) ** 2
+    # Discrete-time stddev approximation from noise density (per sqrt(Hz)).
+    # A common approximation is sigma_sample = nd * sqrt(BW), with BW ~= fs/2.
+    bw_hz = max(rate_hz * 0.5, 1.0)
+    gyro_var = (gyro_nd * math.sqrt(bw_hz)) ** 2
+    accel_var = (accel_nd * math.sqrt(bw_hz)) ** 2
 
     # Order: [Vroll, Vpitch, Vyaw, Ax, Ay, Az]
     cov = [[0.0 for _ in range(6)] for _ in range(6)]
@@ -271,6 +291,18 @@ def main() -> int:
     parser.add_argument("--output_dir", default="./example/output", help="Output directory (default: src/output)")
     parser.add_argument("--output_name", default="trajectory.csv", help="Output filename (default: trajectory.csv)")
     parser.add_argument("--mahalanobis", type=float, default=float("inf"), help="Mahalanobis gate (sigmas)")
+    parser.add_argument(
+        "--remove_gravity",
+        action="store_true",
+        help="Subtract gravity from accelerometer using current roll/pitch estimate",
+        default=True,
+    )
+    parser.add_argument(
+        "--gravity",
+        type=float,
+        default=9.80665,
+        help="Gravity magnitude to subtract when --remove_gravity is set (m/s^2)",
+    )
     parser.add_argument(
         "--abs_pos_sigma",
         type=float,
@@ -424,6 +456,14 @@ def main() -> int:
             while imu_next is not None and imu_next[0] == next_ts:
                 _, wx, wy, wz, ax, ay, az = imu_next
                 imu_next = next(imu_iter, None)
+
+                if args.remove_gravity:
+                    roll = ekf.state[StateMemberRoll]
+                    pitch = ekf.state[StateMemberPitch]
+                    g_bx, g_by, g_bz = _gravity_body_from_rp(roll, pitch, float(args.gravity))
+                    ax -= g_bx
+                    ay -= g_by
+                    az -= g_bz
 
                 meas = Measurement.from_subset(
                     time=t_sec,
